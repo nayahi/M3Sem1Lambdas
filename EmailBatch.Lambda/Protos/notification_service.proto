@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+option csharp_namespace = "ECommerceGRPC.NotificationService";
+
+package notificationservice;
+
+// Servicio de notificaciones (Email y SMS)
+service NotificationService {
+  // Enviar email
+  rpc SendEmail (SendEmailRequest) returns (NotificationResponse);
+  
+  // Enviar SMS
+  rpc SendSMS (SendSMSRequest) returns (NotificationResponse);
+  
+  // Obtener historial de notificaciones de un usuario
+  rpc GetNotificationHistory (GetNotificationHistoryRequest) returns (NotificationHistoryResponse);
+  
+  // Obtener una notificación por ID
+  rpc GetNotification (GetNotificationRequest) returns (NotificationResponse);
+  
+  // Reenviar una notificación fallida
+  rpc ResendNotification (ResendNotificationRequest) returns (NotificationResponse);
+}
+
+// Solicitud para enviar email
+message SendEmailRequest {
+  int32 user_id = 1;
+  int32 order_id = 2; // Opcional, para emails relacionados con pedidos
+  string email_to = 3;
+  string subject = 4;
+  string body = 5;
+  string template = 6; // OrderConfirmation, PaymentSuccess, ShippingUpdate, etc.
+}
+
+// Solicitud para enviar SMS
+message SendSMSRequest {
+  int32 user_id = 1;
+  string phone_number = 2;
+  string message = 3;
+  string template = 4; // OrderUpdate, DeliveryNotification, etc.
+}
+
+// Solicitud para obtener historial de notificaciones
+message GetNotificationHistoryRequest {
+  int32 user_id = 1;
+  string notification_type = 2; // Email, SMS, o vacío para todos
+  int32 page_number = 3;
+  int32 page_size = 4;
+}
+
+// Solicitud para obtener una notificación
+message GetNotificationRequest {
+  int32 notification_id = 1;
+}
+
+// Solicitud para reenviar notificación
+message ResendNotificationRequest {
+  int32 notification_id = 1;
+}
+
+// Respuesta de notificación
+message NotificationResponse {
+  int32 notification_id = 1;
+  int32 user_id = 2;
+  int32 order_id = 3;
+  string notification_type = 4; // Email, SMS
+  string recipient = 5; // Email address o phone number
+  string subject = 6; // Para emails
+  string message = 7;
+  string template = 8;
+  string status = 9; // Pending, Sent, Failed
+  string failure_reason = 10;
+  string sent_at = 11;
+  string created_at = 12;
+}
+
+// Respuesta de historial de notificaciones
+message NotificationHistoryResponse {
+  repeated NotificationResponse notifications = 1;
+  int32 total_count = 2;
+  int32 page_number = 3;
+  int32 page_size = 4;
+}

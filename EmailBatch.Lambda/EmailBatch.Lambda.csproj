@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFramework>net8.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+		<AWSProjectType>Lambda</AWSProjectType>
+		<!-- This property makes the build directory similar to a publish directory and helps the AWS .NET Lambda Mock Test Tool find project dependencies. -->
+		<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+		<!-- Generate ready to run images during publishing to improve cold start time. -->
+		<PublishReadyToRun>true</PublishReadyToRun>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<!-- Protos de servicios externos (Client) -->
+		<Protobuf Include="Protos\notification_service.proto" GrpcServices="Client" />
+	</ItemGroup>
+	
+	<ItemGroup>
+		<PackageReference Include="Amazon.Lambda.Core" Version="2.8.0" />
+		<PackageReference Include="Amazon.Lambda.Serialization.SystemTextJson" Version="2.4.4" />
+		<PackageReference Include="Amazon.Lambda.SQSEvents" Version="2.2.0" />
+		<PackageReference Include="AWSSDK.SQS" Version="3.7.300" />
+
+		<PackageReference Include="Amazon.Lambda.S3Events" Version="3.1.0" />
+		<PackageReference Include="AWSSDK.S3" Version="3.7.400" />
+
+		 <!--gRPC Client--> 
+		<PackageReference Include="Grpc.Net.Client" Version="2.76.0" />
+		<PackageReference Include="Grpc.Tools" Version="2.76.0">
+			<PrivateAssets>all</PrivateAssets>
+			<IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+		</PackageReference>
+		<PackageReference Include="Google.Protobuf" Version="3.27.0" />
+		<PackageReference Include="Amazon.Lambda.Logging.AspNetCore" Version="3.1.0" />
+	</ItemGroup>
+</Project>

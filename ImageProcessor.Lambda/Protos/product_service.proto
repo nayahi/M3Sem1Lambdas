@@ -1,0 +1,180 @@
+syntax = "proto3";
+
+option csharp_namespace = "ECommerceGRPC.ProductService";
+
+package productservice;
+
+// Servicio de gestión de productos con comunicación gRPC
+service ProductService {
+  // Obtiene un producto específico por ID (Unary)
+  rpc GetProduct (GetProductRequest) returns (ProductResponse);
+  
+  // Lista productos con paginación y filtros (Server Streaming)
+  rpc GetProducts (GetProductsRequest) returns (stream ProductResponse);
+  
+  // Crea un nuevo producto (Unary)
+  rpc CreateProduct (CreateProductRequest) returns (ProductResponse);
+  
+  // Actualiza un producto existente (Unary)
+  rpc UpdateProduct (UpdateProductRequest) returns (ProductResponse);
+  
+  // Elimina un producto de forma lógica (Unary)
+  rpc DeleteProduct (DeleteProductRequest) returns (DeleteProductResponse);
+  
+  // Busca productos por término (Server Streaming)
+  rpc SearchProducts (SearchProductsRequest) returns (stream ProductResponse);
+
+  /////////////////////////////Inventario
+  // Reservar stock temporalmente (para saga)
+  rpc ReserveStock (ReserveStockRequest) returns (ReserveStockResponse);
+  // Confirmar reserva (commit en saga exitosa)
+  rpc ConfirmReservation (ConfirmReservationRequest) returns (ConfirmReservationResponse);
+  // Liberar reserva (rollback en saga fallida)
+  rpc ReleaseReservation (ReleaseReservationRequest) returns (ReleaseReservationResponse);
+  // Verificar disponibilidad de stock
+  rpc CheckAvailability (CheckAvailabilityRequest) returns (CheckAvailabilityResponse);
+
+  // Hola
+  //rpc SayHello (HelloRequest) returns (HelloReply);
+}
+
+// Mensaje que representa un producto completo
+message ProductResponse {
+  int32 id = 1;
+  string name = 2;
+  string description = 3;
+  double price = 4;
+  int32 stock = 5;
+  string category = 6;
+  string created_at = 7;
+  string updated_at = 8;
+  bool is_active = 9;
+}
+
+// Solicitud para obtener un producto por ID
+message GetProductRequest {
+  int32 id = 1;
+}
+
+// Solicitud para listar productos con filtros opcionales
+message GetProductsRequest {
+  int32 page_number = 1;      // Número de página (default: 1)
+  int32 page_size = 2;         // Tamaño de página (default: 10)
+  string category = 3;         // Filtro opcional por categoría
+  double min_price = 4;        // Filtro opcional precio mínimo
+  double max_price = 5;        // Filtro opcional precio máximo
+  bool active_only = 6;        // Solo productos activos (default: true)
+}
+
+// Solicitud para crear un nuevo producto
+message CreateProductRequest {
+  string name = 1;
+  string description = 2;
+  double price = 3;
+  int32 stock = 4;
+  string category = 5;
+}
+
+// Solicitud para actualizar un producto existente
+message UpdateProductRequest {
+  int32 id = 1;
+  string name = 2;
+  string description = 3;
+  double price = 4;
+  int32 stock = 5;
+  string category = 6;
+  bool is_active = 7;
+}
+
+// Solicitud para eliminar un producto
+message DeleteProductRequest {
+  int32 id = 1;
+}
+
+// Respuesta de eliminación de producto
+message DeleteProductResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Solicitud para buscar productos por término
+message SearchProductsRequest {
+  string search_term = 1;      // Término de búsqueda
+  int32 page_number = 2;       // Número de página (default: 1)
+  int32 page_size = 3;         // Tamaño de página (default: 10)
+}
+
+ /////////////////////////////Inventario
+// Reservar stock temporalmente
+message ReserveStockRequest {
+  int32 product_id = 1;
+  int32 quantity = 2;
+  int32 order_id = 3;
+}
+
+message ReserveStockResponse {
+  bool success = 1;
+  string reservation_id = 2;
+  int32 product_id = 3;
+  int32 quantity_reserved = 4;
+  string message = 5;
+  string reserved_at = 6;
+}
+
+// Confirmar reserva (commit)
+message ConfirmReservationRequest {
+  string reservation_id = 1;
+}
+
+message ConfirmReservationResponse {
+  bool success = 1;
+  string reservation_id = 2;
+  int32 product_id = 3;
+  int32 quantity_confirmed = 4;
+  string message = 5;
+  string confirmed_at = 6;
+}
+
+// Liberar reserva (rollback)
+message ReleaseReservationRequest {
+  string reservation_id = 1;
+  string reason = 2;
+}
+
+message ReleaseReservationResponse {
+  bool success = 1;
+  string reservation_id = 2;
+  int32 product_id = 3;
+  int32 quantity_released = 4;
+  string message = 5;
+  string released_at = 6;
+  string reason = 7;
+}
+
+// Verificar disponibilidad
+message CheckAvailabilityRequest {
+  int32 product_id = 1;
+  int32 quantity = 2;
+}
+
+message CheckAvailabilityResponse {
+  int32 product_id = 1;
+  string product_name = 2;
+  int32 total_stock = 3;
+  int32 reserved_stock = 4;
+  int32 available_stock = 5;
+  int32 requested_quantity = 6;
+  bool available = 7;
+  string message = 8;
+}
+
+/////////////////Basico para probar gRPC/////////////////////
+// Respuesta Nombre de usuario
+//message HelloRequest {
+  //string name = 1;
+//}
+
+// Respuesta del saludo
+//message HelloReply {
+  //string message = 1;
+//}

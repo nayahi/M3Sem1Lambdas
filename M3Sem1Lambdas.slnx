@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="EmailBatch.Lambda/EmailBatch.Lambda.csproj" />
+  <Project Path="ImageProcessor.Lambda/ImageProcessor.Lambda.csproj" />
+  <Project Path="Reports.Lambda/Reports.Lambda.csproj" />
+</Solution>
