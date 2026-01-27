@@ -1,4 +1,11 @@
 <Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="cleanLambdas.ps1" />
+    <File Path="Deploy-All-Lambdas.ps1" />
+    <File Path="test-image.jpg" />
+    <File Path="TestLambdas.ps1" />
+    <File Path="validarEmail.ps1" />
+  </Folder>
   <Project Path="EmailBatch.Lambda/EmailBatch.Lambda.csproj" />
   <Project Path="ImageProcessor.Lambda/ImageProcessor.Lambda.csproj" />
   <Project Path="Reports.Lambda/Reports.Lambda.csproj" />
