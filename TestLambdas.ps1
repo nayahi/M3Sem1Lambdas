@@ -257,7 +257,7 @@ function Test-ImageProcessor {
 
     # Copiar imagen al contenedor
     docker cp $testImagePath ${ContainerName}:/tmp/test-image.jpg
-    # Remove-Item $testImagePath -Force #no borrarlo para pruebas siguientes
+    Remove-Item $testImagePath -Force #no borrarlo para pruebas siguientes
 
     # Usar ProductId que podría existir (1, 2, 3 están pre-cargados en ProductService)
     Write-Host "`n  📤 Subiendo imagen a S3..." -ForegroundColor Yellow
@@ -586,13 +586,13 @@ function Test-EmailBatch {
 $results = @{}
 
 #comentar los tests que no se ocupan correr
- if ($Test -eq "All" -or $Test -eq "ImageProcessor") {
+if ($Test -eq "All" -or $Test -eq "ImageProcessor") {
     $results["ImageProcessor"] = Test-ImageProcessor
- }
+  }
 
- if ($Test -eq "All" -or $Test -eq "Reports") {
+if ($Test -eq "All" -or $Test -eq "Reports") {
     $results["Reports"] = Test-Reports
- }
+  }
 
 if ($Test -eq "All" -or $Test -eq "EmailBatch") {
     $results["EmailBatch"] = Test-EmailBatch
