@@ -1,9 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
-using Amazon.Lambda.Core;
+﻿using Amazon.Lambda.Core;
 using Amazon.Lambda.SQSEvents;
 using ECommerceGRPC.NotificationService;
 using Grpc.Core;
@@ -12,56 +7,20 @@ using Polly;
 using Polly.CircuitBreaker;
 using Polly.Retry;
 using Polly.Timeout;
+using System.Text.Json;
 
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
 
-namespace EmailBatch.Lambda
+namespace EmailBatch.Lambda;
+
+public class Function
 {
-    /// <summary>
-    /// Lambda function para procesar emails en batch CON RESILIENCIA (Polly).
-    /// 
-    /// SEMANA 2 - CAMBIOS CON POLLY:
-    /// ✅ Circuit Breaker: Abre después de 50% de fallas en 30 segundos
-    /// ✅ Retry Policy: 2 intentos con backoff exponencial
-    /// ✅ Timeout Policy: 10 segundos máximo por llamada gRPC
-    /// 
-    /// Flujo:
-    /// 1. Recibe batch de mensajes desde SQS
-    /// 2. Por cada mensaje, envía email vía NotificationService.gRPC
-    /// 3. Circuit Breaker protege contra sobrecarga del servicio
-    /// 4. Si circuit abre, mensajes van a DLQ para reprocesar después
-    /// 
-    /// Integración: NotificationService.gRPC (puerto 7005)
-    /// Event Source: SQS (email-notifications-queue)
-    /// DLQ: email-notifications-dlq
-    /// </summary>
-    public class Function : IDisposable
-    {
-        private GrpcChannel? _channel;
-        private NotificationService.NotificationServiceClient? _client;
-        private readonly string _notificationServiceUrl;
-
-        // ✅ SEMANA 2: Pipeline de resiliencia Polly (singleton para reutilizar)
-        private static ResiliencePipeline<NotificationResponse>? _resiliencePipeline;
-
-        public Function()
+    // gRPC client lazy initialization
+    private static Lazy<NotificationService.NotificationServiceClient> _lazyNotificationClient =
+        new Lazy<NotificationService.NotificationServiceClient>(() =>
         {
-            // ✅ SOLO guardar la URL, NO crear el canal aún (lazy initialization)
-            _notificationServiceUrl = Environment.GetEnvironmentVariable("NOTIFICATION_SERVICE_URL")
-                ?? "http://notificationservice:7005";
-
-            Console.WriteLine($"EmailBatch Lambda inicializada. Service URL: {_notificationServiceUrl}");
-        }
-
-        /// <summary>
-        /// ✅ SEMANA 1: Crear conexión bajo demanda (lazy initialization)
-        /// </summary>
-        private void EnsureGrpcClient()
-        {
-            if (_client != null)
-                return;
-
-            _channel = GrpcChannel.ForAddress(_notificationServiceUrl, new GrpcChannelOptions
+            var notificationUrl = Environment.GetEnvironmentVariable("NOTIFICATION_SERVICE_URL") ?? "http://notificationservice:7005";
+            var channel = GrpcChannel.ForAddress(notificationUrl, new GrpcChannelOptions
             {
                 Credentials = ChannelCredentials.Insecure,
                 HttpHandler = new SocketsHttpHandler
@@ -73,210 +32,206 @@ namespace EmailBatch.Lambda
                     ConnectTimeout = TimeSpan.FromSeconds(5)
                 }
             });
+            return new NotificationService.NotificationServiceClient(channel);
+        });
 
-            _client = new NotificationService.NotificationServiceClient(_channel);
-        }
+    private static NotificationService.NotificationServiceClient NotificationClient => _lazyNotificationClient.Value;
 
-        /// <summary>
-        /// ✅ SEMANA 2: Configurar pipeline de resiliencia Polly
-        /// Pipeline: Timeout → Circuit Breaker → Retry → gRPC Call
-        /// </summary>
-        private ResiliencePipeline<NotificationResponse> GetOrCreateResiliencePipeline(ILambdaContext context)
+    // Polly Pipeline - Circuit Breaker + Retry + Timeout
+    private static readonly Lazy<ResiliencePipeline<NotificationResponse>> _resiliencePipeline =
+        new Lazy<ResiliencePipeline<NotificationResponse>>(() =>
         {
-            if (_resiliencePipeline != null)
-                return _resiliencePipeline;
-
-            // Leer configuración desde variables de ambiente (con defaults)
+            // Configuración desde variables de ambiente
             var circuitFailureRatio = double.Parse(Environment.GetEnvironmentVariable("CIRCUIT_FAILURE_RATIO") ?? "0.5");
             var circuitSamplingDuration = int.Parse(Environment.GetEnvironmentVariable("CIRCUIT_SAMPLING_DURATION_SECONDS") ?? "30");
             var circuitBreakDuration = int.Parse(Environment.GetEnvironmentVariable("CIRCUIT_BREAK_DURATION_SECONDS") ?? "30");
             var retryMaxAttempts = int.Parse(Environment.GetEnvironmentVariable("RETRY_MAX_ATTEMPTS") ?? "2");
             var timeoutSeconds = int.Parse(Environment.GetEnvironmentVariable("TIMEOUT_SECONDS") ?? "10");
 
-            context.Logger.LogInformation($"[POLLY CONFIG] CircuitFailureRatio={circuitFailureRatio}, " +
-                $"SamplingDuration={circuitSamplingDuration}s, BreakDuration={circuitBreakDuration}s, " +
-                $"MaxRetries={retryMaxAttempts}, Timeout={timeoutSeconds}s");
-
-            var pipelineBuilder = new ResiliencePipelineBuilder<NotificationResponse>();
-
-            // 1️⃣ TIMEOUT POLICY (capa externa - máximo tiempo absoluto)
-            pipelineBuilder.AddTimeout(new TimeoutStrategyOptions
-            {
-                Timeout = TimeSpan.FromSeconds(timeoutSeconds),
-                OnTimeout = args =>
+            return new ResiliencePipelineBuilder<NotificationResponse>()
+                // 1. Circuit Breaker (primera línea de defensa)
+                .AddCircuitBreaker(new CircuitBreakerStrategyOptions<NotificationResponse>
                 {
-                    context.Logger.LogError($"[POLLY TIMEOUT] Operación excedió {timeoutSeconds}s");
-                    return ValueTask.CompletedTask;
-                }
-            });
-
-            // 2️⃣ CIRCUIT BREAKER POLICY
-            pipelineBuilder.AddCircuitBreaker(new CircuitBreakerStrategyOptions<NotificationResponse>
-            {
-                FailureRatio = circuitFailureRatio,
-                SamplingDuration = TimeSpan.FromSeconds(circuitSamplingDuration),
-                MinimumThroughput = 5,  // Mínimo 5 requests antes de evaluar
-                BreakDuration = TimeSpan.FromSeconds(circuitBreakDuration),
-                ShouldHandle = new PredicateBuilder<NotificationResponse>()
-                    .Handle<RpcException>()
-                    .Handle<TimeoutException>()
-                    .Handle<HttpRequestException>()
-                    .HandleResult(response => response.Status == "Failed"),
-                OnOpened = args =>
-                {
-                    context.Logger.LogError("[POLLY CIRCUIT] ⚠️ CIRCUIT ABIERTO - Rechazando requests por sobrecarga");
-                    context.Logger.LogError($"[POLLY CIRCUIT] Motivo: {args.Outcome.Exception?.Message ?? args.Outcome.Result?.FailureReason ?? "Unknown"}");
-                    return ValueTask.CompletedTask;
-                },
-                OnClosed = args =>
-                {
-                    context.Logger.LogInformation("[POLLY CIRCUIT] ✅ CIRCUIT CERRADO - Servicio recuperado");
-                    return ValueTask.CompletedTask;
-                },
-                OnHalfOpened = args =>
-                {
-                    context.Logger.LogInformation("[POLLY CIRCUIT] 🔄 CIRCUIT HALF-OPEN - Probando servicio...");
-                    return ValueTask.CompletedTask;
-                }
-            });
-
-            // 3️⃣ RETRY POLICY (menos intentos que ImageProcessor porque tenemos Circuit Breaker)
-            pipelineBuilder.AddRetry(new RetryStrategyOptions<NotificationResponse>
-            {
-                MaxRetryAttempts = retryMaxAttempts,
-                Delay = TimeSpan.FromSeconds(1),
-                BackoffType = DelayBackoffType.Exponential,
-                UseJitter = true,
-                ShouldHandle = new PredicateBuilder<NotificationResponse>()
-                    .Handle<RpcException>()
-                    .Handle<TimeoutException>()
-                    .Handle<HttpRequestException>()
-                    .HandleResult(response => response.Status == "Failed"),
-                OnRetry = args =>
-                {
-                    var attemptNumber = args.AttemptNumber + 1;
-                    var delay = args.RetryDelay.TotalSeconds;
-                    context.Logger.LogWarning($"[POLLY RETRY] Intento {attemptNumber}/{retryMaxAttempts} después de {delay:F1}s");
-
-                    if (args.Outcome.Exception != null)
+                    FailureRatio = circuitFailureRatio,
+                    SamplingDuration = TimeSpan.FromSeconds(circuitSamplingDuration),
+                    MinimumThroughput = 5,
+                    BreakDuration = TimeSpan.FromSeconds(circuitBreakDuration),
+                    ShouldHandle = new PredicateBuilder<NotificationResponse>()
+                        .Handle<RpcException>()
+                        .Handle<TimeoutRejectedException>(),
+                    OnOpened = args =>
                     {
-                        context.Logger.LogWarning($"[POLLY RETRY] Excepción: {args.Outcome.Exception.Message}");
-                    }
-                    else if (args.Outcome.Result != null)
+                        Console.WriteLine($"🔴 [POLLY CIRCUIT] Estado: ABIERTO - Circuit breaker activado");
+                        Console.WriteLine($"   Failure Ratio alcanzado: {circuitFailureRatio * 100}%");
+                        Console.WriteLine($"   Duration: {circuitBreakDuration} segundos");
+                        return ValueTask.CompletedTask;
+                    },
+                    OnClosed = args =>
                     {
-                        context.Logger.LogWarning($"[POLLY RETRY] Email falló: {args.Outcome.Result.FailureReason}");
+                        Console.WriteLine($"🟢 [POLLY CIRCUIT] Estado: CERRADO - Circuit breaker desactivado");
+                        return ValueTask.CompletedTask;
+                    },
+                    OnHalfOpened = args =>
+                    {
+                        Console.WriteLine($"🟡 [POLLY CIRCUIT] Estado: HALF-OPEN - Probando si servicio se recuperó");
+                        return ValueTask.CompletedTask;
                     }
+                })
+                // 2. Retry (después de circuit breaker)
+                .AddRetry(new RetryStrategyOptions<NotificationResponse>
+                {
+                    MaxRetryAttempts = retryMaxAttempts,
+                    Delay = TimeSpan.FromSeconds(1),
+                    BackoffType = DelayBackoffType.Exponential,
+                    UseJitter = true,
+                    ShouldHandle = new PredicateBuilder<NotificationResponse>()
+                        .Handle<RpcException>(ex =>
+                            ex.StatusCode == StatusCode.Unavailable ||
+                            ex.StatusCode == StatusCode.DeadlineExceeded)
+                        .Handle<TimeoutRejectedException>(),
+                    OnRetry = args =>
+                    {
+                        var delay = args.RetryDelay.TotalSeconds;
+                        Console.WriteLine($"🔄 [POLLY RETRY] Intento {args.AttemptNumber}/{retryMaxAttempts} después de {delay:F1}s");
+                        if (args.Outcome.Exception != null)
+                        {
+                            Console.WriteLine($"   Razón: {args.Outcome.Exception.Message}");
+                        }
+                        return ValueTask.CompletedTask;
+                    }
+                })
+                // 3. Timeout (límite por operación)
+                .AddTimeout(new TimeoutStrategyOptions
+                {
+                    Timeout = TimeSpan.FromSeconds(timeoutSeconds),
+                    OnTimeout = args =>
+                    {
+                        Console.WriteLine($"⏱️ [POLLY TIMEOUT] Operación cancelada después de {timeoutSeconds}s");
+                        return ValueTask.CompletedTask;
+                    }
+                })
+                .Build();
+        });
 
-                    return ValueTask.CompletedTask;
-                }
-            });
+    public async Task FunctionHandler(SQSEvent sqsEvent, ILambdaContext context)
+    {
+        context.Logger.LogInformation($"📧 EmailBatch Lambda iniciada - Mensajes recibidos: {sqsEvent.Records.Count}");
 
-            _resiliencePipeline = pipelineBuilder.Build();
-            context.Logger.LogInformation("[POLLY] Pipeline de resiliencia configurado exitosamente");
+        // Log de configuración Polly
+        var circuitFailureRatio = Environment.GetEnvironmentVariable("CIRCUIT_FAILURE_RATIO") ?? "0.5";
+        var circuitBreakDuration = Environment.GetEnvironmentVariable("CIRCUIT_BREAK_DURATION_SECONDS") ?? "30";
+        var retryMaxAttempts = Environment.GetEnvironmentVariable("RETRY_MAX_ATTEMPTS") ?? "2";
 
-            return _resiliencePipeline;
-        }
+        context.Logger.LogInformation($"⚙️ [POLLY CONFIG] Circuit Breaker: {circuitFailureRatio} ratio, {circuitBreakDuration}s break");
+        context.Logger.LogInformation($"⚙️ [POLLY CONFIG] Retry: {retryMaxAttempts} intentos");
 
-        public async Task FunctionHandler(SQSEvent sqsEvent, ILambdaContext context)
+        var pipeline = _resiliencePipeline.Value;
+        var successCount = 0;
+        var failureCount = 0;
+        var circuitOpenCount = 0;
+
+        foreach (var record in sqsEvent.Records)
         {
-            context.Logger.LogInformation("===========================================");
-            context.Logger.LogInformation($"📧 EmailBatch Lambda (SEMANA 2 con Polly)");
-            context.Logger.LogInformation($"📬 Procesando {sqsEvent.Records.Count} mensaje(s)");
-            context.Logger.LogInformation($"🔗 NotificationService URL: {_notificationServiceUrl}");
-            context.Logger.LogInformation("===========================================");
-
-            // ✅ SEMANA 1: Crear cliente gRPC AQUÍ (lazy initialization)
             try
             {
-                EnsureGrpcClient();
-                context.Logger.LogInformation("✓ Cliente gRPC inicializado");
+                context.Logger.LogInformation($"\n📬 Procesando mensaje {record.MessageId}");
+
+                // Deserializar mensaje
+                var emailRequest = JsonSerializer.Deserialize<EmailNotificationRequest>(record.Body);
+
+                if (emailRequest == null)
+                {
+                    context.Logger.LogError("❌ Error: Mensaje inválido (deserialización falló)");
+                    failureCount++;
+                    continue;
+                }
+
+                context.Logger.LogInformation($"   Para: {emailRequest.EmailTo}");
+                context.Logger.LogInformation($"   Asunto: {emailRequest.Subject}");
+
+                // Enviar email con resiliencia
+                var response = await SendEmailWithResilience(emailRequest, pipeline, context);
+
+                if (response.Status == "Sent")
+                {
+                    successCount++;
+                    context.Logger.LogInformation($"✅ Email enviado exitosamente a {emailRequest.EmailTo}");
+                }
+                else if (response.Status == "CircuitOpen")
+                {
+                    // Circuit está abierto - mensaje debe ir a DLQ
+                    circuitOpenCount++;
+                    context.Logger.LogWarning($"⚡ [POLLY CIRCUIT] Circuit ABIERTO - Mensaje redirigido a DLQ");
+                    throw new Exception("Circuit breaker abierto - mensaje redirigido a DLQ");
+                }
+                else
+                {
+                    failureCount++;
+                    context.Logger.LogWarning($"⚠️ Email falló: {response.FailureReason}");
+                }
+            }
+            catch (RpcException ex) when (ex.StatusCode == StatusCode.Unavailable)
+            {
+                // Servicio no disponible - después de reintentos
+                failureCount++;
+                context.Logger.LogError($"❌ [gRPC ERROR] NotificationService no disponible: {ex.Status.Detail}");
+                context.Logger.LogError($"   Todos los reintentos fallaron");
+                context.Logger.LogError($"   Mensaje será enviado a DLQ");
+
+                // Relanzar para que SQS marque como fallido
+                throw;
+            }
+            catch (TimeoutRejectedException ex)
+            {
+                // Timeout después de reintentos
+                failureCount++;
+                context.Logger.LogError($"⏱️ [TIMEOUT] Timeout después de reintentos: {ex.Message}");
+                context.Logger.LogError($"   Mensaje será enviado a DLQ");
+
+                // Relanzar para que SQS marque como fallido
+                throw;
             }
             catch (Exception ex)
             {
-                context.Logger.LogError($"✗ Error inicializando cliente gRPC: {ex.Message}");
+                // Cualquier otra excepción
+                failureCount++;
+                context.Logger.LogError($"❌ Error inesperado: {ex.GetType().Name}");
+                context.Logger.LogError($"   Mensaje: {ex.Message}");
+
+                // Relanzar para que SQS marque como fallido
                 throw;
             }
-
-            // ✅ SEMANA 2: Obtener pipeline de resiliencia
-            var pipeline = GetOrCreateResiliencePipeline(context);
-
-            var processedCount = 0;
-            var failedCount = 0;
-            var circuitOpenCount = 0;
-
-            foreach (var record in sqsEvent.Records)
-            {
-                try
-                {
-                    context.Logger.LogInformation($"\n--- Procesando mensaje {record.MessageId} ---");
-
-                    var emailRequest = JsonSerializer.Deserialize<EmailNotificationRequest>(record.Body);
-                    context.Logger.LogInformation($"📧 Destino: {emailRequest.EmailTo}, Asunto: {emailRequest.Subject}");
-
-                    // ✅ SEMANA 2: Enviar email con Polly pipeline
-                    var response = await SendEmailWithResilience(emailRequest, pipeline, context);
-
-                    if (response.Status == "Sent")
-                    {
-                        context.Logger.LogInformation($"✅ Email enviado exitosamente");
-                        processedCount++;
-                    }
-                    else if (response.Status == "CircuitOpen")
-                    {
-                        // Circuit está abierto - mensaje irá a DLQ para reprocesar después
-                        context.Logger.LogWarning($"⚠️ Circuit abierto - Mensaje enviado a DLQ");
-                        circuitOpenCount++;
-                        throw new Exception("Circuit breaker abierto - mensaje redirigido a DLQ");
-                    }
-                    else
-                    {
-                        context.Logger.LogWarning($"⚠️ Email falló: {response.FailureReason}");
-                        failedCount++;
-                    }
-                }
-                catch (BrokenCircuitException)
-                {
-                    // Circuit abierto - mensaje va a DLQ
-                    context.Logger.LogError($"❌ Circuit ABIERTO - Mensaje redirigido a DLQ");
-                    circuitOpenCount++;
-                    throw; // Re-throw para que SQS envíe a DLQ
-                }
-                catch (RpcException rpcEx)
-                {
-                    context.Logger.LogError($"❌ Error gRPC: {rpcEx.Status.StatusCode} - {rpcEx.Status.Detail}");
-                    failedCount++;
-                    throw; // Re-throw para SQS retry/DLQ
-                }
-                catch (Exception ex)
-                {
-                    context.Logger.LogError($"❌ Error procesando mensaje: {ex.Message}");
-                    failedCount++;
-                    throw; // Re-throw para SQS retry/DLQ
-                }
-            }
-
-            context.Logger.LogInformation("\n===========================================");
-            context.Logger.LogInformation($"📊 Resumen:");
-            context.Logger.LogInformation($"  ✅ Exitosos: {processedCount}");
-            context.Logger.LogInformation($"  ❌ Fallidos: {failedCount}");
-            context.Logger.LogInformation($"  ⚠️ Circuit abierto: {circuitOpenCount}");
-            context.Logger.LogInformation("===========================================");
         }
 
-        /// <summary>
-        /// ✅ SEMANA 2: Enviar email con Polly pipeline
-        /// Pipeline: Timeout → Circuit Breaker → Retry → gRPC Call
-        /// </summary>
-        private async Task<NotificationResponse> SendEmailWithResilience(
-            EmailNotificationRequest emailRequest,
-            ResiliencePipeline<NotificationResponse> pipeline,
-            ILambdaContext context)
-        {
-            try
-            {
-                context.Logger.LogInformation("[POLLY] Ejecutando llamada gRPC con resiliencia...");
+        // Resumen
+        context.Logger.LogInformation($"\n📊 Resumen de procesamiento:");
+        context.Logger.LogInformation($"   ✅ Exitosos: {successCount}");
+        context.Logger.LogInformation($"   ❌ Fallidos: {failureCount}");
+        context.Logger.LogInformation($"   ⚡ Circuit abierto: {circuitOpenCount}");
+        context.Logger.LogInformation($"   📧 Total: {sqsEvent.Records.Count}");
 
-                var request = new SendEmailRequest
+        if (failureCount > 0 || circuitOpenCount > 0)
+        {
+            context.Logger.LogWarning($"⚠️ Lambda completada con {failureCount + circuitOpenCount} fallas");
+        }
+        else
+        {
+            context.Logger.LogInformation($"🎉 Todos los mensajes procesados exitosamente");
+        }
+    }
+
+    private async Task<NotificationResponse> SendEmailWithResilience(
+        EmailNotificationRequest emailRequest,
+        ResiliencePipeline<NotificationResponse> pipeline,
+        ILambdaContext context)
+    {
+        try
+        {
+            // Ejecutar con Polly pipeline (Circuit Breaker + Retry + Timeout)
+            return await pipeline.ExecuteAsync(async ct =>
+            {
+                // Llamada gRPC al NotificationService
+                var grpcRequest = new SendEmailRequest
                 {
                     UserId = emailRequest.UserId,
                     OrderId = emailRequest.OrderId,
@@ -286,63 +241,38 @@ namespace EmailBatch.Lambda
                     Template = emailRequest.Template ?? "Default"
                 };
 
-                // Ejecutar con pipeline de resiliencia
-                var response = await pipeline.ExecuteAsync(async ct =>
-                {
-                    context.Logger.LogInformation($"  → Enviando email vía gRPC...");
-                    return await _client!.SendEmailAsync(request, cancellationToken: ct);
-                }, CancellationToken.None);  // ✅ CORREGIDO: usar CancellationToken.None
-
-                context.Logger.LogInformation($"[POLLY] Respuesta recibida. Status: {response.Status}");
-
-                return response;
-            }
-            catch (BrokenCircuitException)
-            {
-                // Circuit está abierto - retornar respuesta especial
-                context.Logger.LogWarning("[POLLY] Circuit abierto - no se puede procesar");
-                return new NotificationResponse
-                {
-                    NotificationId = 0,
-                    UserId = emailRequest.UserId,
-                    OrderId = emailRequest.OrderId,
-                    NotificationType = "Email",
-                    Recipient = emailRequest.EmailTo,
-                    Subject = emailRequest.Subject,
-                    Message = emailRequest.Body,
-                    Template = emailRequest.Template,
-                    Status = "CircuitOpen",
-                    FailureReason = "Circuit breaker is open - service unavailable",
-                    CreatedAt = DateTime.UtcNow.ToString("o")
-                };
-            }
-            catch (Exception ex)
-            {
-                // Otros errores no manejados
-                context.Logger.LogError($"[POLLY] ❌ Error no manejado: {ex.Message}");
-                throw;
-            }
+                return await NotificationClient.SendEmailAsync(grpcRequest, cancellationToken: ct);
+            }, CancellationToken.None);
         }
-
-        /// <summary>
-        /// ✅ SEMANA 1: Cleanup al destruir (opcional pero buena práctica)
-        /// </summary>
-        public void Dispose()
+        catch (BrokenCircuitException)
         {
-            _channel?.Dispose();
+            // Circuit está abierto - retornar respuesta especial
+            context.Logger.LogWarning("[POLLY] Circuit abierto - no se puede procesar");
+            return new NotificationResponse
+            {
+                NotificationId = 0,
+                UserId = emailRequest.UserId,
+                OrderId = emailRequest.OrderId,
+                NotificationType = "Email",
+                Recipient = emailRequest.EmailTo,
+                Subject = emailRequest.Subject,
+                Message = emailRequest.Body,
+                Template = emailRequest.Template,
+                Status = "CircuitOpen",
+                FailureReason = "Circuit breaker is open - service unavailable",
+                CreatedAt = DateTime.UtcNow.ToString("o")
+            };
         }
     }
+}
 
-    /// <summary>
-    /// Modelo de request de email desde SQS
-    /// </summary>
-    public class EmailNotificationRequest
-    {
-        public int UserId { get; set; }
-        public int OrderId { get; set; }
-        public string EmailTo { get; set; } = string.Empty;
-        public string Subject { get; set; } = string.Empty;
-        public string Body { get; set; } = string.Empty;
-        public string Template { get; set; } = string.Empty;
-    }
+// DTOs
+public class EmailNotificationRequest
+{
+    public int UserId { get; set; }
+    public int OrderId { get; set; }
+    public string EmailTo { get; set; } = string.Empty;
+    public string Subject { get; set; } = string.Empty;
+    public string Body { get; set; } = string.Empty;
+    public string Template { get; set; } = string.Empty;
 }
