@@ -362,3 +362,5 @@ MigrationBackup/
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
 /nousar
+/Deploy-All-Lambdas-v5
+/products_1_optimized.jpg

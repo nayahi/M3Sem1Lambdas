@@ -400,6 +400,7 @@ if ($LASTEXITCODE -eq 0) {
             
             docker exec $ContainerName awslocal lambda update-event-source-mapping `
                 --uuid $mappingUuid `
+                --maximum-retry-attempts 2 `
                 --destination-config "{`"OnFailure`":{`"Destination`":`"$dlqArn`"}}" `
                 --output json 2>&1 | Out-Null
             
@@ -416,6 +417,7 @@ if ($LASTEXITCODE -eq 0) {
                     --function-name EmailBatchProcessorFunction `
                     --event-source-arn $queueArn `
                     --batch-size 10 `
+                    --maximum-retry-attempts 2 `
                     --enabled `
                     --destination-config "{`"OnFailure`":{`"Destination`":`"$dlqArn`"}}" | Out-Null
                 
@@ -432,6 +434,7 @@ if ($LASTEXITCODE -eq 0) {
             --function-name EmailBatchProcessorFunction `
             --event-source-arn $queueArn `
             --batch-size 10 `
+            --maximum-retry-attempts 2 `
             --enabled `
             --destination-config "{`"OnFailure`":{`"Destination`":`"$dlqArn`"}}" | Out-Null
         
