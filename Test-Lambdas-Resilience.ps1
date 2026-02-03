@@ -233,7 +233,14 @@ function Test-NormalScenario {
     Write-Host "  📤 Subiendo imagen a S3..." -ForegroundColor Yellow
     docker cp $testImagePath ${ContainerName}:/tmp/test-image-normal.jpg
     
-    $productId = Get-Random -Minimum 100 -Maximum 999
+    #if ($productServiceRunning) {
+        Write-Host "     Usando ProductId existente: 1 (debería existir en BD)" -ForegroundColor Gray
+        $productId = 1
+    #} else {
+     #   Write-Host "     Usando ProductId aleatorio (solo test de procesamiento de imagen)" -ForegroundColor Gray
+        #$productId = Get-Random -Minimum 1 -Maximum 12
+    #}
+	
     $s3Key = "products/$productId/test-normal.jpg"
     
     # ✅ CORRECTO: Subir DESDE el contenedor
@@ -354,7 +361,14 @@ function Test-ImageProcessorFallback {
     # ✅ Copiar al contenedor PRIMERO
     docker cp $testImagePath ${ContainerName}:/tmp/test-image-fallback.jpg
 
-    $productId = Get-Random -Minimum 100 -Maximum 999
+    #if ($productServiceRunning) {
+        Write-Host "     Usando ProductId existente: 1 (debería existir en BD)" -ForegroundColor Gray
+        $productId = 1
+    #} else {
+     #   Write-Host "     Usando ProductId aleatorio (solo test de procesamiento de imagen)" -ForegroundColor Gray
+        #$productId = Get-Random -Minimum 1 -Maximum 12
+    #}
+	
     $s3Key = "products/$productId/test-fallback.jpg"
     
     # ✅ Subir DESDE el contenedor

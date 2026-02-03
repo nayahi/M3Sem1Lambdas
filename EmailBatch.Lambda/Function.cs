@@ -78,6 +78,19 @@ namespace EmailBatch.Lambda
                     context.Logger.LogInformation($"Procesando mensaje {record.MessageId}");
 
                     var emailRequest = JsonSerializer.Deserialize<EmailNotificationRequest>(record.Body);
+                    if (emailRequest == null)
+                    {
+                        throw new ArgumentException($"El mensaje SQS {record.MessageId} no pudo ser deserializado correctamente.");
+                    }
+
+                    // Validar campos requeridos
+                    if (string.IsNullOrWhiteSpace(emailRequest.EmailTo))
+                        throw new ArgumentNullException(nameof(emailRequest.EmailTo), "El campo 'EmailTo' no puede ser nulo o vacío.");
+                    if (string.IsNullOrWhiteSpace(emailRequest.Subject))
+                        throw new ArgumentNullException(nameof(emailRequest.Subject), "El campo 'Subject' no puede ser nulo o vacío.");
+                    if (string.IsNullOrWhiteSpace(emailRequest.Body))
+                        throw new ArgumentNullException(nameof(emailRequest.Body), "El campo 'Body' no puede ser nulo o vacío.");
+
                     context.Logger.LogInformation($"Destino: {emailRequest.EmailTo}, Asunto: {emailRequest.Subject}");
 
                     var request = new SendEmailRequest

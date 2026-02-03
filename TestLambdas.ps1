@@ -267,7 +267,7 @@ function Test-ImageProcessor {
         $productId = 1
     } else {
         Write-Host "     Usando ProductId aleatorio (solo test de procesamiento de imagen)" -ForegroundColor Gray
-        $productId = Get-Random -Minimum 1000 -Maximum 9999
+        $productId = Get-Random -Minimum 1 -Maximum 12
     }
     
     $s3Key = "products/$productId/original.jpg"
