@@ -20,5 +20,7 @@
 	  <PackageReference Include="Amazon.Lambda.Logging.AspNetCore" Version="3.1.0" />	  
 	  
 	  <PackageReference Include="Amazon.Lambda.S3Events" Version="3.1.0" />
+	  <!-- ✅ NUEVO: Redis para caché distribuido -->
+	  <PackageReference Include="StackExchange.Redis" Version="2.8.16" />
   </ItemGroup>
 </Project>

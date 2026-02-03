@@ -1,29 +1,36 @@
-﻿using Amazon.Lambda.Core;
+﻿using System.Text.Json;
 using Amazon.Lambda.APIGatewayEvents;
+using Amazon.Lambda.Core;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.Data.SqlClient;
 using QuestPDF.Fluent;
 using QuestPDF.Helpers;
 using QuestPDF.Infrastructure;
-using System.Text.Json;
+using StackExchange.Redis;
+using QuestContainer = QuestPDF.Infrastructure.IContainer;
+// ✅ FIX: Aliases para evitar ambigüedad con System.Reflection.Metadata y System.ComponentModel
+using QuestDocument = QuestPDF.Fluent.Document;
 
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
 
 namespace Reports.Lambda
 {
     /// <summary>
-    /// Lambda function para generación de reportes on-demand.
+    /// Lambda function para generación de reportes on-demand con Redis cache.
+    /// Implementa Cache-Aside pattern para optimizar queries costosas.
     /// </summary>
     public class Function
     {
         private readonly IAmazonS3 _s3Client;
         private readonly string _connectionString;
         private readonly string _reportsBucket;
+        private readonly IConnectionMultiplexer? _redis;
+        private readonly IDatabase? _redisDb;
 
         public Function()
         {
-            // ✅ CRÍTICO: Configurar licencia QuestPDF
+            // ✅ Configurar licencia QuestPDF
             QuestPDF.Settings.License = LicenseType.Community;
 
             // Configuración de S3 para LocalStack
@@ -38,6 +45,25 @@ namespace Reports.Lambda
                 ?? "Server=localhost,1433;User Id=sa;Password=Password123!;TrustServerCertificate=True;";
 
             _reportsBucket = Environment.GetEnvironmentVariable("REPORTS_BUCKET") ?? "reports-generated";
+
+            // ✅ NUEVO: Configurar Redis con manejo de errores
+            try
+            {
+                var redisEndpoint = Environment.GetEnvironmentVariable("REDIS_ENDPOINT") ?? "localhost:6379";
+                Console.WriteLine($"📦 Conectando a Redis: {redisEndpoint}");
+
+                _redis = ConnectionMultiplexer.Connect(redisEndpoint);
+                _redisDb = _redis.GetDatabase();
+
+                Console.WriteLine("✅ Redis conectado correctamente");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Redis no disponible: {ex.Message}");
+                Console.WriteLine("⚠️ Continuando sin caché (fallback mode)");
+                _redis = null;
+                _redisDb = null;
+            }
         }
 
         public Function(IAmazonS3 s3Client, string connectionString, string reportsBucket)
@@ -54,9 +80,9 @@ namespace Reports.Lambda
         {
             try
             {
-                context.Logger.LogInformation("Generando reporte on-demand");
+                context.Logger.LogInformation("🚀 Generando reporte on-demand");
 
-                // ✅ FIX: Parsear parámetros correctamente
+                // Parsear parámetros
                 string reportType = "sales";
                 string startDate = DateTime.Now.AddDays(-30).ToString("yyyy-MM-dd");
                 string endDate = DateTime.Now.ToString("yyyy-MM-dd");
@@ -73,7 +99,7 @@ namespace Reports.Lambda
                         endDate = request.QueryStringParameters["endDate"];
                 }
 
-                context.Logger.LogInformation($"Tipo: {reportType}, Rango: {startDate} a {endDate}");
+                context.Logger.LogInformation($"📊 Tipo: {reportType}, Rango: {startDate} a {endDate}");
 
                 // Validar parámetros
                 if (!DateTime.TryParse(startDate, out var start) || !DateTime.TryParse(endDate, out var end))
@@ -86,14 +112,63 @@ namespace Reports.Lambda
                     return CreateResponse(400, new { error = "La fecha de inicio debe ser menor a la fecha fin" });
                 }
 
-                // Obtener datos según el tipo de reporte
-                var reportData = reportType.ToLower() switch
+                // ✅ NUEVO: Intentar obtener datos desde caché
+                var cacheKey = $"report:{reportType}:{startDate}:{endDate}";
+                ReportData? reportData = null;
+                bool cacheHit = false;
+
+                if (_redisDb != null)
                 {
-                    "sales" => await GenerateSalesReport(start, end, context),
-                    "products" => await GenerateProductsReport(start, end, context),
-                    "orders" => await GenerateOrdersReport(start, end, context),
-                    _ => throw new ArgumentException($"Tipo de reporte no soportado: {reportType}")
-                };
+                    try
+                    {
+                        var cachedJson = await _redisDb.StringGetAsync(cacheKey);
+                        if (cachedJson.HasValue)
+                        {
+                            reportData = JsonSerializer.Deserialize<ReportData>(cachedJson!);
+                            cacheHit = true;
+                            context.Logger.LogInformation($"🎯 CACHE HIT: Datos obtenidos desde Redis");
+                        }
+                        else
+                        {
+                            context.Logger.LogInformation($"❌ CACHE MISS: Consultando base de datos");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Logger.LogWarning($"⚠️ Error leyendo caché: {ex.Message}");
+                    }
+                }
+
+                // Si no hay cache hit, obtener datos de BD
+                if (reportData == null)
+                {
+                    reportData = reportType.ToLower() switch
+                    {
+                        "sales" => await GenerateSalesReport(start, end, context),
+                        "products" => await GenerateProductsReport(start, end, context),
+                        "orders" => await GenerateOrdersReport(start, end, context),
+                        _ => throw new ArgumentException($"Tipo de reporte no soportado: {reportType}")
+                    };
+
+                    // ✅ NUEVO: Guardar en caché con TTL de 10 minutos
+                    if (_redisDb != null && reportData != null)
+                    {
+                        try
+                        {
+                            var jsonData = JsonSerializer.Serialize(reportData);
+                            await _redisDb.StringSetAsync(
+                                cacheKey,
+                                jsonData,
+                                TimeSpan.FromMinutes(10) // TTL: 10 minutos
+                            );
+                            context.Logger.LogInformation($"💾 Datos guardados en caché (TTL: 10 min)");
+                        }
+                        catch (Exception ex)
+                        {
+                            context.Logger.LogWarning($"⚠️ Error guardando en caché: {ex.Message}");
+                        }
+                    }
+                }
 
                 // Generar PDF
                 var pdfBytes = GeneratePDF(reportData, reportType, start, end, context);
@@ -108,7 +183,10 @@ namespace Reports.Lambda
                     generatedAt = DateTime.UtcNow,
                     downloadUrl = reportUrl,
                     expiresIn = "1 hour",
-                    fileSize = pdfBytes.Length
+                    fileSize = pdfBytes.Length,
+                    // ✅ NUEVO: Indicar si vino de caché
+                    cacheHit = cacheHit,
+                    cacheKey = cacheKey
                 });
             }
             catch (ArgumentException ex)
@@ -140,37 +218,32 @@ namespace Reports.Lambda
                     SUM(o.TotalAmount) as VentasTotal,
                     AVG(o.TotalAmount) as TicketPromedio
                 FROM ECommerceOrders.dbo.Orders o
-                WHERE o.CreatedAt >= @StartDate 
-                    AND o.CreatedAt <= @EndDate
-                    AND o.Status IN ('Completed', 'Processing')
+                WHERE o.CreatedAt >= @StartDate AND o.CreatedAt <= @EndDate
                 GROUP BY CAST(o.CreatedAt AS DATE)
                 ORDER BY Fecha DESC;
 
-                -- Ventas por categoría de producto
+                -- Top 10 productos más vendidos
                 SELECT TOP 10
                     oi.ProductName,
                     SUM(oi.Quantity) as CantidadVendida,
-                    SUM(oi.Quantity * oi.UnitPrice) as IngresoTotal
+                    SUM(oi.Price * oi.Quantity) as IngresoTotal
                 FROM ECommerceOrders.dbo.OrderItems oi
                 INNER JOIN ECommerceOrders.dbo.Orders o ON oi.OrderId = o.Id
-                WHERE o.CreatedAt >= @StartDate 
-                    AND o.CreatedAt <= @EndDate
-                    AND o.Status IN ('Completed', 'Processing')
+                WHERE o.CreatedAt >= @StartDate AND o.CreatedAt <= @EndDate
                 GROUP BY oi.ProductName
                 ORDER BY IngresoTotal DESC;
 
-                -- Métodos de pago más usados
+                -- Métodos de pago más utilizados
                 SELECT 
                     p.PaymentMethod,
                     COUNT(*) as TotalTransacciones,
                     SUM(p.Amount) as MontoTotal,
                     AVG(p.Amount) as MontoPromedio
                 FROM ECommercePayments.dbo.Payments p
-                WHERE p.CreatedAt >= @StartDate 
-                    AND p.CreatedAt <= @EndDate
+                WHERE p.CreatedAt >= @StartDate AND p.CreatedAt <= @EndDate
                     AND p.Status = 'Completed'
                 GROUP BY p.PaymentMethod
-                ORDER BY MontoTotal DESC;
+                ORDER BY TotalTransacciones DESC;
             ";
 
             using (var connection = new SqlConnection(_connectionString))
@@ -183,7 +256,7 @@ namespace Reports.Lambda
 
                     using (var reader = await command.ExecuteReaderAsync())
                     {
-                        // ✅ FIX: Leer ventas diarias con conversiones correctas
+                        // Ventas por día
                         var salesByDay = new List<Dictionary<string, object>>();
                         while (await reader.ReadAsync())
                         {
@@ -198,7 +271,7 @@ namespace Reports.Lambda
                         }
                         reportData.Sections.Add("Ventas Diarias", salesByDay);
 
-                        // ✅ FIX: Leer top productos
+                        // Top productos
                         await reader.NextResultAsync();
                         var topProducts = new List<Dictionary<string, object>>();
                         while (await reader.ReadAsync())
@@ -212,7 +285,7 @@ namespace Reports.Lambda
                         }
                         reportData.Sections.Add("Top 10 Productos", topProducts);
 
-                        // ✅ FIX: Leer métodos de pago
+                        // Métodos de pago
                         await reader.NextResultAsync();
                         var paymentMethods = new List<Dictionary<string, object>>();
                         while (await reader.ReadAsync())
@@ -230,7 +303,7 @@ namespace Reports.Lambda
                 }
             }
 
-            context.Logger.LogInformation($"Datos obtenidos: {reportData.Sections.Count} secciones");
+            context.Logger.LogInformation($"📊 Datos obtenidos: {reportData.Sections.Count} secciones");
             return reportData;
         }
 
@@ -247,21 +320,19 @@ namespace Reports.Lambda
                 SELECT 
                     Category as Categoría,
                     COUNT(*) as TotalProductos,
-                    SUM(Stock) as InventarioTotal,
                     AVG(Price) as PrecioPromedio
-                FROM ECommerceGRPCProducts.dbo.Products
-                WHERE IsActive = 1
+                FROM ECommerceProducts.dbo.Products
                 GROUP BY Category
                 ORDER BY TotalProductos DESC;
 
-                -- Productos con stock bajo
-                SELECT TOP 20
+                -- Productos con stock bajo (menos de 10 unidades)
+                SELECT 
                     Name as Producto,
-                    Category as Categoría,
-                    Stock as Inventario,
-                    Price as Precio
-                FROM ECommerceGRPCProducts.dbo.Products
-                WHERE IsActive = 1 AND Stock < 50
+                    Stock as 'Stock Actual',
+                    Price as Precio,
+                    Category as Categoría
+                FROM ECommerceProducts.dbo.Products
+                WHERE Stock < 10
                 ORDER BY Stock ASC;
             ";
 
@@ -279,9 +350,8 @@ namespace Reports.Lambda
                             byCategory.Add(new Dictionary<string, object>
                             {
                                 ["Categoría"] = reader.GetString(0),
-                                ["Productos"] = reader.GetInt32(1).ToString(),
-                                ["Stock Total"] = reader.GetInt32(2).ToString(),
-                                ["Precio Promedio"] = $"${reader.GetDecimal(3):N2}"
+                                ["Total"] = reader.GetInt32(1).ToString(),
+                                ["Precio Promedio"] = $"${reader.GetDecimal(2):N2}"
                             });
                         }
                         reportData.Sections.Add("Productos por Categoría", byCategory);
@@ -294,9 +364,9 @@ namespace Reports.Lambda
                             lowStock.Add(new Dictionary<string, object>
                             {
                                 ["Producto"] = reader.GetString(0),
-                                ["Categoría"] = reader.GetString(1),
-                                ["Stock"] = reader.GetInt32(2).ToString(),
-                                ["Precio"] = $"${reader.GetDecimal(3):N2}"
+                                ["Stock"] = reader.GetInt32(1).ToString(),
+                                ["Precio"] = $"${reader.GetDecimal(2):N2}",
+                                ["Categoría"] = reader.GetString(3)
                             });
                         }
                         reportData.Sections.Add("Alerta: Stock Bajo", lowStock);
@@ -380,11 +450,13 @@ namespace Reports.Lambda
             return reportData;
         }
 
-        private byte[] GeneratePDF(ReportData data, string reportType, DateTime startDate, DateTime endDate, ILambdaContext context)
+        private byte[] GeneratePDF(ReportData? data, string reportType, DateTime startDate, DateTime endDate, ILambdaContext context)
         {
-            context.Logger.LogInformation("Generando PDF con QuestPDF");
+            if (data == null) throw new ArgumentNullException(nameof(data));
 
-            var document = Document.Create(container =>
+            context.Logger.LogInformation("📄 Generando PDF con QuestPDF");
+
+            var document = QuestDocument.Create(container =>
             {
                 container.Page(page =>
                 {
@@ -408,10 +480,10 @@ namespace Reports.Lambda
             });
 
             var pdfBytes = document.GeneratePdf();
-            context.Logger.LogInformation($"PDF generado: {pdfBytes.Length} bytes");
+            context.Logger.LogInformation($"✅ PDF generado: {pdfBytes.Length} bytes");
             return pdfBytes;
 
-            void ComposeHeader(IContainer container)
+            void ComposeHeader(QuestContainer container)
             {
                 container.Row(row =>
                 {
@@ -426,14 +498,12 @@ namespace Reports.Lambda
                 });
             }
 
-            // ✅ CORRECCIÓN: Llamar Column UNA SOLA VEZ, loop dentro
-            void ComposeContent(IContainer container, ReportData data)
+            void ComposeContent(QuestContainer container, ReportData data)
             {
-                container.Column(outerColumn =>  // ✅ UNA SOLA VEZ
+                container.Column(outerColumn =>
                 {
-                    foreach (var section in data.Sections)  // ✅ LOOP DENTRO
+                    foreach (var section in data.Sections)
                     {
-                        // Título de sección
                         outerColumn.Item().PaddingTop(15).Text(section.Key).FontSize(14).SemiBold();
 
                         if (section.Value.Any())
@@ -441,10 +511,8 @@ namespace Reports.Lambda
                             var firstRow = section.Value.First();
                             var headers = firstRow.Keys.ToList();
 
-                            // Tabla
                             outerColumn.Item().Table(table =>
                             {
-                                // Definir columnas
                                 table.ColumnsDefinition(columns =>
                                 {
                                     foreach (var _ in headers)
@@ -453,7 +521,6 @@ namespace Reports.Lambda
                                     }
                                 });
 
-                                // Header de tabla
                                 table.Header(header =>
                                 {
                                     foreach (var h in headers)
@@ -461,14 +528,13 @@ namespace Reports.Lambda
                                         header.Cell().Element(CellStyle).Text(h).SemiBold();
                                     }
 
-                                    static IContainer CellStyle(IContainer container)
+                                    static QuestContainer CellStyle(QuestContainer container)
                                     {
                                         return container.DefaultTextStyle(x => x.SemiBold())
                                             .PaddingVertical(5).BorderBottom(1).BorderColor(Colors.Black);
                                     }
                                 });
 
-                                // Rows de tabla
                                 foreach (var row in section.Value)
                                 {
                                     foreach (var header in headers)
@@ -476,7 +542,7 @@ namespace Reports.Lambda
                                         table.Cell().Element(CellStyle).Text(row[header]?.ToString() ?? "");
                                     }
 
-                                    static IContainer CellStyle(IContainer container)
+                                    static QuestContainer CellStyle(QuestContainer container)
                                     {
                                         return container.BorderBottom(1).BorderColor(Colors.Grey.Lighten2)
                                             .PaddingVertical(3);
@@ -498,7 +564,7 @@ namespace Reports.Lambda
             var fileName = $"{reportType}_{DateTime.UtcNow:yyyyMMdd_HHmmss}.pdf";
             var key = $"reports/{DateTime.UtcNow:yyyy/MM}/{fileName}";
 
-            context.Logger.LogInformation($"Subiendo a S3: {key}");
+            context.Logger.LogInformation($"📤 Subiendo a S3: {key}");
 
             using (var stream = new MemoryStream(pdfBytes))
             {
@@ -520,19 +586,14 @@ namespace Reports.Lambda
                 Expires = DateTime.UtcNow.AddHours(1)
             };
 
-            // ✅ CORRECCIÓN: Generar URL accesible desde fuera de Docker
             var s3Endpoint = Environment.GetEnvironmentVariable("S3_ENDPOINT") ?? "http://localhost:4566";
+            var preSignedUrl = _s3Client.GetPreSignedURL(urlRequest);
 
-            var downloadUrl = _s3Client.GetPreSignedURL(urlRequest);
-            context.Logger.LogInformation($"Download URL generada (interna a docker): {downloadUrl}");
+            // Fix para LocalStack: reemplazar hostname interno
+            var fixedUrl = preSignedUrl.Replace("localstack", "localhost");
 
-            // ✅ IMPORTANTE: Reemplazar endpoint interno con externo
-            var url = downloadUrl.Replace("http://localstack:4566", "http://localhost:4566")
-                                     .Replace("https://localstack:4566", "http://localhost:4566");
-
-            context.Logger.LogInformation($"URL generada (externa a docker): {url}");
-
-            return url;
+            context.Logger.LogInformation($"✅ URL generada (válida 1 hora)");
+            return fixedUrl;
         }
 
         private APIGatewayProxyResponse CreateResponse(int statusCode, object body)
@@ -550,10 +611,11 @@ namespace Reports.Lambda
         }
     }
 
+    // Modelo para datos del reporte (serializable para Redis)
     public class ReportData
     {
-        public string Title { get; set; } = string.Empty;
-        public string Period { get; set; } = string.Empty;
+        public string Title { get; set; } = "";
+        public string Period { get; set; } = "";
         public Dictionary<string, List<Dictionary<string, object>>> Sections { get; set; } = new();
     }
 }
