@@ -50,6 +50,9 @@ if ([string]::IsNullOrWhiteSpace($apiId)) {
 $endpoint = "http://localhost:4566/restapis/$apiId/prod/_user_request_/reports"
 Write-Host "✅ API Endpoint: $endpoint" -ForegroundColor Green
 
+Write-Host "✅ Limpiar cache" -ForegroundColor Green
+docker exec -it microservices-redis redis-cli FLUSHALL
+
 # Función para medir tiempo de respuesta
 function Invoke-TimedRequest {
     param(
@@ -144,21 +147,23 @@ Write-Host "`n╔═════════════════════
 Write-Host "║          TEST 4: Inspeccionar Redis Directamente              ║" -ForegroundColor Yellow
 Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Yellow
 
-Write-Host "`n🔍 Keys almacenados en Redis:" -ForegroundColor Cyan
-$keys = docker exec $ContainerName redis-cli -h redis KEYS "report:*"
-if ($keys) {
-    $keys | ForEach-Object {
-        Write-Host "  🔑 $_" -ForegroundColor Green
-    }
-} else {
-    Write-Host "  ⚠️ No se encontraron keys" -ForegroundColor Yellow
-}
+Write-Host "`n🔍 Keys almacenados en Redis: 1=SI 0=no" -ForegroundColor Cyan
+docker exec -it microservices-redis redis-cli EXISTS "report:sales:2024-01-01:2024-12-31"
+# # Write-Host "`n🔍 Keys almacenados en Redis:" -ForegroundColor Cyan
+ # $keys = docker exec $ContainerName redis-cli redis KEYS "report:*"
+ # if ($keys) {
+     # $keys | ForEach-Object {
+         # Write-Host "  🔑 $_" -ForegroundColor Green
+     # }
+ # } else {
+     # Write-Host "  ⚠️ No se encontraron keys" -ForegroundColor Yellow
+ # }
 
-Write-Host "`n🔍 TTL del primer reporte:" -ForegroundColor Cyan
-if ($result1.CacheKey) {
-    $ttl = docker exec $ContainerName redis-cli -h redis TTL "$($result1.CacheKey)"
-    Write-Host "  ⏰ TTL restante: $ttl segundos (de 600)" -ForegroundColor Yellow
-}
+# Write-Host "`n🔍 TTL del primer reporte:" -ForegroundColor Cyan
+# if ($result1.CacheKey) {
+    # $ttl = docker exec $ContainerName redis-cli redis TTL "$($result1.CacheKey)"
+    # Write-Host "  ⏰ TTL restante: $ttl segundos (de 600)" -ForegroundColor Yellow
+# }
 
 # ═══════════════════════════════════════════════════════════════════
 # RESUMEN DE RESULTADOS
